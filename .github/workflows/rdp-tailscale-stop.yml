@@ -1,13 +1,17 @@
-name: Tailscale Stop/Cleanup (delete devices by prefix)
+name: Tailscale cleanup
 
 on:
   workflow_dispatch:
     inputs:
-      ts_tailnet:  { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
-      ts_api_key:  { description: "Tailscale API key (device admin, no Bearer)", required: true }
-      base_prefix: { description: "Hostname prefix to delete (e.g. bullet)", required: true, default: "bullet" }
-      max_count:   { description: "Max devices to delete", required: false, default: "10" }
-      dry_run:     { description: "true = list only; false = delete", required: false, default: "false" }
+      hostname_prefix:
+        description: "Delete devices whose hostname starts with this prefix"
+        required: false
+        default: "gha-rdp-"
+      dry_run:
+        description: "List matches without deleting them"
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -17,36 +21,45 @@ defaults:
     shell: pwsh
 
 jobs:
-  stop:
+  cleanup:
     runs-on: ubuntu-latest
+    env:
+      TS_TAILNET: ${{ secrets.TS_TAILNET }}
+      TS_API_KEY: ${{ secrets.TS_API_KEY }}
+
     steps:
-      - name: Delete devices with prefix
+      - name: Remove matching Tailscale devices
         run: |
-          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          if ([string]::IsNullOrWhiteSpace($env:TS_TAILNET)) {
+            throw "Missing repository secret: TS_TAILNET"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TS_API_KEY)) {
+            throw "Missing repository secret: TS_API_KEY"
+          }
+          Write-Output "::add-mask::$env:TS_API_KEY"
 
-          $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
-          $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
-          $prefix = "${{ inputs.base_prefix }}"
-          $max = [int]"${{ inputs.max_count }}"
-          $dry = Yes("${{ inputs.dry_run }}")
+          $authBytes = [Text.Encoding]::ASCII.GetBytes("$($env:TS_API_KEY):")
+          $auth = [Convert]::ToBase64String($authBytes)
+          $tailnet = [uri]::EscapeDataString($env:TS_TAILNET)
+          $prefix = "${{ inputs.hostname_prefix }}"
+          $dryRun = "${{ inputs.dry_run }}" -eq "true"
+          $headers = @{ Authorization = "Basic $auth" }
 
-          $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
-          $targets = @($list.devices | Where-Object { $_.hostname -like "$prefix*" } | Select-Object -First $max)
+          $response = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tailnet/devices" -Headers $headers
+          $targets = @($response.devices | Where-Object { $_.hostname -like "$prefix*" })
 
-          if ($targets.Count -eq 0) { Write-Host "No matching devices."; exit 0 }
-
-          Write-Host "Found $($targets.Count) device(s) with prefix '$prefix':"
-          $targets | ForEach-Object { Write-Host " - $($_.hostname) [$($_.id)]" }
-
-          if ($dry) {
-            Write-Host "Dry run: no deletions performed."
+          if ($targets.Count -eq 0) {
+            Write-Host "No matching devices."
             exit 0
           }
 
-          foreach ($d in $targets) {
-            try {
-              Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" }
-              Write-Host "Deleted: $($d.hostname)"
-            } catch { Write-Warning "Failed to delete $($d.hostname): $($_.Exception.Message)" }
+          $targets | ForEach-Object { Write-Host "Matched: $($_.hostname)" }
+          if ($dryRun) {
+            Write-Host "Dry run enabled; nothing was deleted."
+            exit 0
           }
-          Write-Host "Cleanup complete."
+
+          foreach ($device in $targets) {
+            Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($device.id)" -Headers $headers
+            Write-Host "Deleted: $($device.hostname)"
+          }
