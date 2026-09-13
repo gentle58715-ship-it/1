@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: secure-rdp
@@ -26,6 +27,8 @@ jobs:
     env:
       TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
       RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
       RDP_USER: PrivateRemote
 
     steps:
@@ -37,8 +40,12 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
             throw "Missing repository secret: RDP_PASSWORD"
           }
+          if ([string]::IsNullOrWhiteSpace($env:BACKUP_PASSWORD)) {
+            throw "Missing repository secret: BACKUP_PASSWORD"
+          }
           Write-Output "::add-mask::$env:TS_AUTHKEY"
           Write-Output "::add-mask::$env:RDP_PASSWORD"
+          Write-Output "::add-mask::$env:BACKUP_PASSWORD"
 
           $raw = "${{ inputs.runtime_minutes }}"
           $minutes = 300
@@ -89,6 +96,41 @@ jobs:
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Address: $env:TAILSCALE_IP"
 
+      - name: Restore latest encrypted backup
+        run: |
+          $profile = "C:\Users\$env:RDP_USER"
+          @("Desktop", "Documents", "Downloads") | ForEach-Object {
+            New-Item -ItemType Directory -Path (Join-Path $profile $_) -Force | Out-Null
+          }
+
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $api = "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?per_page=100"
+          $items = (Invoke-RestMethod -Uri $api -Headers $headers).artifacts
+          $latest = $items |
+            Where-Object { -not $_.expired -and $_.name -like "rdp-backup-*" } |
+            Sort-Object created_at -Descending |
+            Select-Object -First 1
+
+          if (-not $latest) {
+            Write-Host "No previous backup found; starting with empty folders."
+            exit 0
+          }
+
+          $zip = "$env:RUNNER_TEMP\backup.zip"
+          $extract = "$env:RUNNER_TEMP\backup-download"
+          Invoke-WebRequest -Uri $latest.archive_download_url -Headers $headers -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+          $encrypted = Join-Path $extract "rdp-backup.7z"
+          if (-not (Test-Path $encrypted)) { throw "Backup archive is missing" }
+          & "C:\Program Files\7-Zip\7z.exe" x $encrypted "-p$env:BACKUP_PASSWORD" "-o$profile" -y
+          if ($LASTEXITCODE -ne 0) { throw "Backup password is incorrect or archive is damaged" }
+          Write-Host "Latest encrypted backup restored."
+
       - name: Keep session available
         run: |
           $end = (Get-Date).AddMinutes([int]$env:RUNTIME_MINUTES)
@@ -96,6 +138,33 @@ jobs:
             Write-Host ("Session active; ends near " + $end.ToString("u"))
             Start-Sleep -Seconds 60
           }
+
+      - name: Create encrypted backup
+        if: always()
+        run: |
+          $profile = "C:\Users\$env:RDP_USER"
+          @("Desktop", "Documents", "Downloads") | ForEach-Object {
+            New-Item -ItemType Directory -Path (Join-Path $profile $_) -Force | Out-Null
+          }
+
+          $archive = "$env:RUNNER_TEMP\rdp-backup.7z"
+          Push-Location $profile
+          try {
+            & "C:\Program Files\7-Zip\7z.exe" a -t7z $archive "Desktop" "Documents" "Downloads" "-p$env:BACKUP_PASSWORD" -mhe=on -mx=5
+            if ($LASTEXITCODE -ne 0) { throw "Could not create encrypted backup" }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Upload encrypted backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-backup-${{ github.run_id }}
+          path: ${{ runner.temp }}\rdp-backup.7z
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
 
       - name: Disconnect Tailscale
         if: always()
