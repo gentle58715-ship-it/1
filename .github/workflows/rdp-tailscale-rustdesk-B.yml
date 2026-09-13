@@ -9,7 +9,7 @@ on:
         default: "300"
 
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 concurrency:
@@ -60,6 +60,7 @@ jobs:
           Write-Output "::add-mask::$env:TS_AUTHKEY"
           Write-Output "::add-mask::$env:RDP_PASSWORD"
           Write-Output "::add-mask::$env:BACKUP_PASSWORD"
+          Write-Output "::add-mask::$env:GH_TOKEN"
 
           $raw = "${{ inputs.runtime_minutes }}"
           $minutes = 300
@@ -119,68 +120,175 @@ jobs:
             New-Item -ItemType Directory -Path (Join-Path $profile $_) -Force | Out-Null
           }
 
-          $headers = @{
-            Authorization = "Bearer $env:GH_TOKEN"
-            Accept = "application/vnd.github+json"
-            "X-GitHub-Api-Version" = "2022-11-28"
-          }
-          $api = "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?per_page=100"
-          $items = (Invoke-RestMethod -Uri $api -Headers $headers).artifacts
-          $latest = $items |
-            Where-Object { -not $_.expired -and $_.name -like "rdp-backup-*" } |
-            Sort-Object created_at -Descending |
-            Select-Object -First 1
+          $restoreUrl = "https://raw.githubusercontent.com/${{ github.repository }}/rdp-backups/rdp-backup.7z"
+          $encrypted = "$env:RUNNER_TEMP\rdp-backup-restore.7z"
 
-          if (-not $latest) {
-            Write-Host "No previous backup found; starting with empty folders."
+          try {
+            Invoke-WebRequest -Uri $restoreUrl -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -OutFile $encrypted -ErrorAction Stop
+          } catch {
+            Write-Host "No previous branch backup found; starting with empty folders."
             exit 0
           }
 
-          $zip = "$env:RUNNER_TEMP\backup.zip"
-          $extract = "$env:RUNNER_TEMP\backup-download"
-          Invoke-WebRequest -Uri $latest.archive_download_url -Headers $headers -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          if (-not (Test-Path $encrypted)) {
+            Write-Host "No previous branch backup found; starting with empty folders."
+            exit 0
+          }
 
-          $encrypted = Join-Path $extract "rdp-backup.7z"
-          if (-not (Test-Path $encrypted)) { throw "Backup archive is missing" }
           & "C:\Program Files\7-Zip\7z.exe" x $encrypted "-p$env:BACKUP_PASSWORD" "-o$profile" -y
           if ($LASTEXITCODE -ne 0) { throw "Backup password is incorrect or archive is damaged" }
-          Write-Host "Latest encrypted backup restored."
+          Write-Host "Latest encrypted backup restored from rdp-backups branch."
 
-      - name: Keep session available
+      - name: Keep session available with auto backup
         run: |
+          function Save-EncryptedBackup {
+            param(
+              [string] $Reason
+            )
+
+            $profile = "C:\Users\$env:RDP_USER"
+            @("Desktop", "Documents", "Downloads") | ForEach-Object {
+              New-Item -ItemType Directory -Path (Join-Path $profile $_) -Force | Out-Null
+            }
+
+            $archive = "$env:RUNNER_TEMP\rdp-backup.7z"
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+
+            Push-Location $profile
+            try {
+              & "C:\Program Files\7-Zip\7z.exe" a -t7z $archive "Desktop" "Documents" "Downloads" "-p$env:BACKUP_PASSWORD" -mhe=on -mx=5
+              if ($LASTEXITCODE -ne 0) { throw "Could not create encrypted backup" }
+            } finally {
+              Pop-Location
+            }
+
+            $work = "$env:RUNNER_TEMP\rdp-backup-branch"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $work -Force | Out-Null
+
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git clone --depth 1 --branch rdp-backups "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" $work 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              git clone --depth 1 "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" $work
+              if ($LASTEXITCODE -ne 0) { throw "Could not clone repository for backup" }
+              Push-Location $work
+              try {
+                git checkout --orphan rdp-backups
+                git rm -rf . 2>$null
+              } finally {
+                Pop-Location
+              }
+            }
+
+            Copy-Item $archive (Join-Path $work "rdp-backup.7z") -Force
+            $stamp = (Get-Date).ToUniversalTime().ToString("u")
+            @(
+              "Last backup reason: $Reason",
+              "Workflow run: ${{ github.run_id }}",
+              "Updated at UTC: $stamp"
+            ) | Set-Content -Path (Join-Path $work "README.txt") -Encoding utf8
+
+            Push-Location $work
+            try {
+              git add rdp-backup.7z README.txt
+              git commit -m "Update encrypted RDP backup ($Reason)" 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                git push origin rdp-backups
+                if ($LASTEXITCODE -ne 0) { throw "Could not push encrypted backup" }
+                Write-Host "Encrypted backup saved to rdp-backups branch ($Reason)."
+              } else {
+                Write-Host "No backup changes to push ($Reason)."
+              }
+            } finally {
+              Pop-Location
+            }
+          }
+
           $end = (Get-Date).AddMinutes([int]$env:RUNTIME_MINUTES)
+          $nextBackup = (Get-Date).AddMinutes(15)
+
+          Save-EncryptedBackup -Reason "startup"
+
           while ((Get-Date) -lt $end) {
             Write-Host ("Session active; ends near " + $end.ToString("u"))
+
+            if ((Get-Date) -ge $nextBackup) {
+              Save-EncryptedBackup -Reason "auto-15-min"
+              $nextBackup = (Get-Date).AddMinutes(15)
+            }
+
             Start-Sleep -Seconds 60
           }
 
-      - name: Create encrypted backup
+      - name: Create final encrypted backup
         if: always()
         run: |
-          $profile = "C:\Users\$env:RDP_USER"
-          @("Desktop", "Documents", "Downloads") | ForEach-Object {
-            New-Item -ItemType Directory -Path (Join-Path $profile $_) -Force | Out-Null
+          function Save-EncryptedBackup {
+            param(
+              [string] $Reason
+            )
+
+            $profile = "C:\Users\$env:RDP_USER"
+            @("Desktop", "Documents", "Downloads") | ForEach-Object {
+              New-Item -ItemType Directory -Path (Join-Path $profile $_) -Force | Out-Null
+            }
+
+            $archive = "$env:RUNNER_TEMP\rdp-backup.7z"
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+
+            Push-Location $profile
+            try {
+              & "C:\Program Files\7-Zip\7z.exe" a -t7z $archive "Desktop" "Documents" "Downloads" "-p$env:BACKUP_PASSWORD" -mhe=on -mx=5
+              if ($LASTEXITCODE -ne 0) { throw "Could not create encrypted backup" }
+            } finally {
+              Pop-Location
+            }
+
+            $work = "$env:RUNNER_TEMP\rdp-backup-branch-final"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $work -Force | Out-Null
+
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git clone --depth 1 --branch rdp-backups "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" $work 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              git clone --depth 1 "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" $work
+              if ($LASTEXITCODE -ne 0) { throw "Could not clone repository for backup" }
+              Push-Location $work
+              try {
+                git checkout --orphan rdp-backups
+                git rm -rf . 2>$null
+              } finally {
+                Pop-Location
+              }
+            }
+
+            Copy-Item $archive (Join-Path $work "rdp-backup.7z") -Force
+            $stamp = (Get-Date).ToUniversalTime().ToString("u")
+            @(
+              "Last backup reason: $Reason",
+              "Workflow run: ${{ github.run_id }}",
+              "Updated at UTC: $stamp"
+            ) | Set-Content -Path (Join-Path $work "README.txt") -Encoding utf8
+
+            Push-Location $work
+            try {
+              git add rdp-backup.7z README.txt
+              git commit -m "Update encrypted RDP backup ($Reason)" 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                git push origin rdp-backups
+                if ($LASTEXITCODE -ne 0) { throw "Could not push encrypted backup" }
+                Write-Host "Encrypted backup saved to rdp-backups branch ($Reason)."
+              } else {
+                Write-Host "No backup changes to push ($Reason)."
+              }
+            } finally {
+              Pop-Location
+            }
           }
 
-          $archive = "$env:RUNNER_TEMP\rdp-backup.7z"
-          Push-Location $profile
-          try {
-            & "C:\Program Files\7-Zip\7z.exe" a -t7z $archive "Desktop" "Documents" "Downloads" "-p$env:BACKUP_PASSWORD" -mhe=on -mx=5
-            if ($LASTEXITCODE -ne 0) { throw "Could not create encrypted backup" }
-          } finally {
-            Pop-Location
-          }
-
-      - name: Upload encrypted backup
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rdp-backup-${{ github.run_id }}
-          path: ${{ runner.temp }}\rdp-backup.7z
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
+          Save-EncryptedBackup -Reason "final"
 
       - name: Disconnect Tailscale
         if: always()
