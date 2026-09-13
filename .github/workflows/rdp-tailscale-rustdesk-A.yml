@@ -108,8 +108,8 @@ jobs:
           New-NetFirewallRule -DisplayName "Private RDP over Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10 -Profile Any | Out-Null
 
           Write-Host "RDP is ready through Tailscale only."
-          Write-Host "Username: .\\$env:RDP_USER"
-          Write-Host "Full username: $env:COMPUTERNAME\\$env:RDP_USER"
+          Write-Host "Username: .\$env:RDP_USER"
+          Write-Host "Full username: $env:COMPUTERNAME\$env:RDP_USER"
           Write-Host "Address: $env:TAILSCALE_IP"
 
       - name: Restore latest encrypted backup
