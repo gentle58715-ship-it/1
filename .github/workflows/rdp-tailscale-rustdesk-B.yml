@@ -43,6 +43,20 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:BACKUP_PASSWORD)) {
             throw "Missing repository secret: BACKUP_PASSWORD"
           }
+
+          $validRdpPassword =
+            $env:RDP_PASSWORD.Length -ge 12 -and
+            $env:RDP_PASSWORD.Length -le 64 -and
+            $env:RDP_PASSWORD -cmatch '[A-Z]' -and
+            $env:RDP_PASSWORD -cmatch '[a-z]' -and
+            $env:RDP_PASSWORD -match '\d' -and
+            $env:RDP_PASSWORD -match '[^A-Za-z0-9]' -and
+            $env:RDP_PASSWORD.IndexOf($env:RDP_USER, [StringComparison]::OrdinalIgnoreCase) -lt 0
+
+          if (-not $validRdpPassword) {
+            throw "RDP_PASSWORD must be 12-64 characters, include uppercase, lowercase, number and symbol, and must not contain PrivateRemote."
+          }
+
           Write-Output "::add-mask::$env:TS_AUTHKEY"
           Write-Output "::add-mask::$env:RDP_PASSWORD"
           Write-Output "::add-mask::$env:BACKUP_PASSWORD"
